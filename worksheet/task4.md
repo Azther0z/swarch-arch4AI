@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** Teerachot
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6732017921
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** B
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,26 +58,42 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Availability / durability | Accept every review on the kiosk while it is offline. Sync it when the connection returns. |
+| 2 | Turnaround time | Label every accepted review by the end of that day. |
+| 3 | Accuracy and cost | Keep accuracy at or above 90%. Keep large-model calls at or below 40% for a typical workload. |
 
 ## 2. Design / การออกแบบ
 
-Your topology, the patterns you add, and a container-level diagram (C4 level 2). The C4 diagram must be written in Mermaid.
+Topology: T4 asynchronous/batch. An asynchronous design accepts reviews before labeling. An outbox is a local store for unsent reviews. The kiosk keeps each review in its outbox while it is offline, then sends it to a central queue when the network returns. A queue holds work until a worker can process it. A worker is a service that processes queued reviews. It labels reviews in batches before the end of the day. A cascade asks a small model first and uses the large model for uncertain reviews. A cache stores past predictions for reuse. The cache must include the active model version.
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
+    title CampusEats: offline capture and batch labeling
     Person(customer, "Customer", "Writes restaurant reviews")
+    Person(owner, "Restaurant owner", "Reads labeled reviews")
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container_Boundary(kiosk_boundary, "Canteen kiosk") {
+            Container(kiosk, "Review kiosk", "Tablet app", "Accepts submissions")
+            Container(outbox, "Local outbox", "Encrypted local store", "Durably holds reviews offline and syncs on reconnect")
+        }
+        Container(api, "Review API", "Python, FastAPI", "Stores incoming reviews as pending")
+        ContainerDb(review_db, "Review database", "SQL", "Stores reviews, labels, and processing status")
+        Container(queue, "Pending review queue", "Message broker", "Buffers work for asynchronous scoring")
+        Container(worker, "Batch labeling worker", "Python worker", "Processes queued reviews and retries failures")
+        Container(inference, "Inference service", "Python, FastAPI", "Cascade and versioned prediction cache")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    Rel(customer, kiosk, "Submits a review", "App")
+    Rel(kiosk, outbox, "Persists review before acknowledgement", "Local write")
+    Rel(outbox, api, "Syncs queued reviews when online", "HTTPS/JSON")
+    Rel(api, review_db, "Stores pending review")
+    Rel(api, queue, "Enqueues review ID")
+    Rel(worker, queue, "Consumes reviews in batches")
+    Rel(worker, inference, "Requests sentiment score", "HTTP/JSON")
+    Rel(inference, worker, "Returns label")
+    Rel(worker, review_db, "Loads review text and saves label or retry status")
+    Rel(owner, api, "Reads labeled reviews", "HTTPS/JSON")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +104,10 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t0-small | The small model reached 72.5% accuracy. This is below the 90% target. |
+| t2-0.8 | Accuracy was 93.5%. The large model handled 64% of reviews before caching. |
+| t3-cache | Accuracy stayed at 93.5%. Large-model calls fell to 40%, with 34% cache hits. |
+| t1-after | With 10% simulated hangs, fallback had 0 errors. It saved 26 pending reviews out of 200. |
 
 ## 4. ADR
 
@@ -97,20 +115,18 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** Save offline reviews and label them later
 
 **Status:** Proposed
 
-**Context:**
+**Context:** Scenario B kiosks lose Wi-Fi several times each day. The system must accept every review and label it by the end of the day. A synchronous model request cannot work while a kiosk is offline. Large-model calls also cost money and have a 20-call-per-second limit.
 
-**Decision:**
+**Decision:** Use T4 asynchronous/batch. Save each review in the kiosk outbox while it is offline. Send it to the server when the network returns. Store it as pending and add its ID to the queue. The worker reads queued reviews and scores them in batches. It uses cascade at threshold 0.8 and a cache for the active model version. It saves each label and retries failed requests.
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: Reviews stay safe during Wi-Fi outages. The worker can spread scoring across the day. The measured cascade/cache run kept 93.5% accuracy and used the large model for 40% of reviews.
+- Negative: Labels arrive later. The design adds a local store, queue, worker, retries, and cache updates. The 200-review test did not test offline sync or prove the end-of-day target. Test both before release.
 
-**Alternatives considered:** at least one topology you rejected, and why.
+**Alternatives considered:** T1 synchronous model-as-a-service fails when a kiosk is offline. The small model reached 72.5% accuracy in `t0-small`, below the 90% target. The selected design saves each review first and labels it later with cascade and cache.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
-
->
